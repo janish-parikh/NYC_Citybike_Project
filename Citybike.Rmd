@@ -1,0 +1,356 @@
+---
+title: "Untitled"
+author: "Janish Parikh"
+date: "12/6/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(GGally)
+library(lubridate)
+library(caret)
+library(gbm)
+library(tidyverse)
+library(xgboost)
+library(caret)
+```
+
+```{r, cache=TRUE}
+citibike_2019 <- read.csv("~/citibike_2019.csv")
+citibike_2019<-citibike_2019[sample(nrow(citibike_2019),nrow(citibike_2019)/10),]
+citibike_2019 <- citibike_2019 %>% mutate(tripduration = tripduration /60)
+```
+
+```{r}
+is_weekday = function(timestamp){
+  lubridate::wday(timestamp, week_start = 1) < 6
+}
+```
+
+Feature Extraction
+```{r, cache=TRUE}
+citibike_2019$Hour<-cut(hour(citibike_2019$starttime), breaks = c(-1, 5, 12, 16, 20, 24),labels = c("Night", "Morning", "Afternoon", "Evening", "Night"))
+citibike_2019$dayofweek <- as.factor(wday(citibike_2019$starttime))
+citibike_2019$weekday<-as.factor(as.numeric(sapply(citibike_2019$starttime, is_weekday)))
+```
+
+Trip Duration
+Max trip duration 3 hours 
+```{r, cache=TRUE}
+citibike_2019<-citibike_2019[citibike_2019$tripduration<=10800,]
+```
+
+AGE
+```{r, cache=TRUE}
+citibike_2019$age<- 2019 - citibike_2019$birth.year
+summary(citibike_2019$age)
+citibike_2019<-citibike_2019[citibike_2019$age<=90,]
+```
+
+Distance
+```{r, cache=TRUE}
+library(geosphere)
+citibike_2019$distance <- distHaversine(citibike_2019[,6:7], citibike_2019[,10:11])
+citibike_2019$dist.lat <- abs((citibike_2019$start.station.latitude - citibike_2019$end.station.latitude))
+citibike_2019$dist.long <- abs((citibike_2019$start.station.longitude - citibike_2019$end.station.longitude))
+summary(citibike_2019$distance)
+```
+
+Convert into factor variables
+```{r}
+citibike_2019$usertype<-as.factor(citibike_2019$usertype)
+citibike_2019$gender<-as.factor(citibike_2019$gender)
+```
+
+Weather Data
+```{r, cache=TRUE}
+weather <- read.csv("~/Downloads/2812766.csv",header=FALSE)
+names(weather)<-weather[1,]
+weather<-weather[-1,]
+weather<-subset(weather[weather$NAME == "NY CITY CENTRAL PARK, NY US" & year(weather$DATE) == 2019,],)
+weather<-subset(weather, select = -c(STATION,NAME,LATITUDE,LONGITUDE,ELEVATION, AWND_ATTRIBUTES, DAPR_ATTRIBUTES, MDPR_ATTRIBUTES,PGTM_ATTRIBUTES,PRCP_ATTRIBUTES,PSUN_ATTRIBUTES,SNOW_ATTRIBUTES,SNWD_ATTRIBUTES,TAVG_ATTRIBUTES,TMAX_ATTRIBUTES,TMIN_ATTRIBUTES,TOBS_ATTRIBUTES,TSUN_ATTRIBUTES,WDF2_ATTRIBUTES,WDF5_ATTRIBUTES,WESD_ATTRIBUTES,WESF_ATTRIBUTES,WSF2_ATTRIBUTES,WSF5_ATTRIBUTES,WT01_ATTRIBUTES,WT02_ATTRIBUTES,WT03_ATTRIBUTES,WT04_ATTRIBUTES,WT05_ATTRIBUTES, WT06_ATTRIBUTES, WT08_ATTRIBUTES,WT09_ATTRIBUTES,WT11_ATTRIBUTES))
+weather<-weather %>%mutate(across(c(where(is.character), -DATE), as.numeric))%>%mutate_all(~replace_na(., 0))
+weather$DATE<-as.Date(weather$DATE)
+head(weather)
+```
+Join Citibike data with Weather Data
+```{r, cache=TRUE}
+citibike_2019$start_date<-date(citibike_2019$starttime)
+citibike_2019<-merge(citibike_2019, weather, by.x = "start_date", by.y = "DATE")
+names(citibike_2019)
+```
+
+```{r}
+colstouse <-setdiff(names(citibike_2019),c("start_date","starttime","stoptime","start.station.name","end.station.name"))
+train_data<-citibike_2019[ , which(names(citibike_2019) %in% colstouse)]
+```
+Find important features
+```{r, cache=TRUE}
+library(Boruta)
+boruta.train <- Boruta(tripduration~., data = test, doTrace = 2)
+print(boruta.train)
+```
+
+```{r}
+plot(boruta.train, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(boruta.train$ImpHistory),function(i)
+boruta.train$ImpHistory[is.finite(boruta.train$ImpHistory[,i]),i])
+ames(lz) <- colnames(boruta.train$ImpHistory)
+Labels <- sort(sapply(lz,median))
+axis(side = 1,las=2,labels = names(Labels),
+at = 1:ncol(boruta.train$ImpHistory), cex.axis = 0.7)
+```
+
+```{r, fig.align='center',fig.width=20, fig.height=20, dpi= 2000}
+ggcorr(train_data, name = "Correlation", label = TRUE, alpha = TRUE, palette = "PuOr") + ggtitle("Correlation Matrix Plot") + theme_light()
+```
+```{r}
+colstouse<-c("tripduration","gender","age","distance","dist.lat","dist.long","usertype","dayofweek","AWND","PRCP","SNOW","SNWWD","TMAX","TMIN","WDF2","WDF5","WSF5","WT01","WT02")
+```
+
+```{r}
+train_data<-citibike_2019[ , which(names(citibike_2019) %in% colstouse)]
+linear_model<-lm(tripduration~., data = train_data)
+```
+
+```{r}
+summary(linear_model)
+```
+
+```{r}
+test <- read.csv("~/Downloads/citybike.test10000Awithduration.csv")
+test<-test[test$tripduration<=3600,]
+test$Day <- as.numeric(substr(test$starttime,9,10))
+test$Year<-year(test$starttime)
+test$Hour <- as.numeric(format(as.POSIXct(test$starttime), format = "%H"))
+test$dayofweek <- weekdays(as.Date(test$starttime))
+test$start_date <- date(test$starttime)
+test$Age<- test$Year - test$birth.year
+test$weekend<-as.numeric(sapply(test$starttime,is_weekday))
+head(subset(test, select = c(Day, Hour,dayofweek,Year, Age, birth.year)))
+```
+
+```{r}
+test$distance <- distHaversine(test[,4:5], test[,8:9])
+test$distance.lat <- abs((test$start.station.latitude - test$end.station.latitude))
+test$distance.long <- abs((test$start.station.longitude - test$end.station.longitude))
+head(subset(test, select = c(distance,distance.lat,distance.long)))
+```
+
+```{r}
+test<-merge(test, weather, by.x = "start_date", by.y = "DATE")
+test2<-subset(test, select = c(weekend, usertype, gender, Day, Hour,dayofweek,Age,distance,birth.year, distance.lat,  distance.long,PRCP, TMAX, TMIN ))
+```
+
+```{r}
+y_train <- train1$tripduration
+predicted<-predict(linear_model, train1)
+residuals = y_test - predicted
+RMSE = sqrt(mean(residuals^2))
+cat('The root mean square error of the train data is ', round(RMSE,3),'\n')
+
+y_test <- test$tripduration
+predicted<-predict(linear_model, test)
+residuals = y_test - predicted
+RMSE = sqrt(mean(residuals^2))
+cat('The root mean square error of the test data is ', round(RMSE,3),'\n')
+```
+
+
+```{r}
+y_test_mean = mean(y_test)
+# Calculate total sum of squares
+tss =  sum((y_test - y_test_mean)^2 )
+# Calculate residual sum of squares
+rss =  sum(residuals^2)
+# Calculate R-squared
+rsq  =  1 - (rss/tss)
+cat('The R-square of the test data is ', abs(round(rsq,3)), '\n')
+```
+
+```{r}
+my_data = as.data.frame(cbind(predicted = predicted,observed = y_test))
+# Plot predictions vs test data
+ggplot(my_data,aes(predicted, observed)) + geom_point(color = "darkred", alpha = 0.5) + 
+    geom_smooth(method=lm)+ ggtitle('Linear Regression ') + ggtitle("Linear Model: Prediction vs Test Data") +
+      xlab("Predecited Trip Duration ") + ylab("Observed Trip Duration") + 
+        theme(plot.title = element_text(size=16,hjust = 0.5),
+         axis.text.y = element_text(size=12), axis.text.x = element_text(size=12,hjust=.5),
+         axis.title.x = element_text(size=14), axis.title.y = element_text(size=14))
+```
+
+# Gradient Boosted Model
+
+```{r}
+colstouse<-c("tripduration","gender","age","distance","dist.lat","dist.long","usertype","dayofweek","AWND","PRCP","SNOW","SNWWD","TMAX","TMIN","WDF2","WDF5","WSF5","WT01","WT02")
+```
+
+```{r}
+library('gbm')
+fitControl <- trainControl(
+                           method = "repeatedcv",
+                           number = 10,
+                           repeats = 10)
+
+gbmmodel <- train(tripduration ~ ., 
+                 data = train_data,
+                 distribution = "gaussian",
+                 method = "gbm", 
+                 trControl = fitControl,
+                 verbose = F)
+```
+
+```{r}
+print(gbmmodel)
+summary(gbmmodel)
+names(test1)
+```
+```{r}
+set.seed(123)
+# train GBM model
+gbm.fit <- gbm(
+  formula = tripduration ~ .,
+  distribution = "gaussian",
+  data = train_data,
+  n.trees = 10000,
+  interaction.depth = 1,
+  shrinkage = 0.001,
+  cv.folds = 5,
+  n.cores = NULL, # will use all cores by default
+  verbose = FALSE
+  )  
+```
+
+```{r}
+summary(gbm.fit)
+print(gbm.fit)
+```
+
+# XGBoost
+```{r}
+train2<-train_data
+train2$gender<-as.numeric(as.factor(train2$gender))
+train2$usertype<-as.numeric(as.factor(train2$usertype))
+train2$dayofweek<-as.numeric(as.factor(train2$dayofweek))
+summary(train2)
+X_train = as.matrix(subset(train2, select = -c(tripduration)))
+y_train = train2$tripduration
+```
+
+```{r}
+xgb_trcontrol = trainControl(
+  method = "cv",
+  number = 10,  
+  allowParallel = TRUE,
+  verboseIter = T,
+  returnData = FALSE
+)
+```
+
+```{r}
+xgbGrid <- expand.grid(nrounds = 200,
+                       max_depth = 20,
+                       colsample_bytree = 0.9,
+                       eta = 0.1,
+                       gamma=0,
+                       min_child_weight = 1,
+                       subsample = 1
+                      )
+```
+
+```{r, warning=FALSE}
+set.seed(0) 
+xgb_model = train(
+  X_train, y_train,  
+  trControl = xgb_trcontrol,
+  tuneGrid = xgbGrid,
+  method = "xgbTree"
+)
+```
+```{r}
+summary(xgb_model)
+print(xgb_model)
+```
+
+```{r}
+test2$usertype<-as.numeric(as.factor(test2$usertype))
+test2$dayofweek<-as.numeric(as.factor(test2$dayofweek))
+X_test<-as.matrix(subset(test2))
+head(X_test)
+Y_test<-test2$tripduration
+```
+
+```{r}
+y_test<-train_data$tripduration
+predicted = predict(gbmmodel,train_data)
+residuals = y_test - predicted
+RMSE = sqrt(mean(residuals^2))
+cat('The root mean square error of the test data is ', round(RMSE,3),'\n')
+```
+
+```{r}
+y_test_mean = mean(y_test)
+# Calculate total sum of squares
+tss =  sum((y_test - y_test_mean)^2 )
+# Calculate residual sum of squares
+rss =  sum(residuals^2)
+# Calculate R-squared
+rsq  =  1 - (rss/tss)
+cat('The R-square of the test data is ', round(rsq,3), '\n')
+```
+
+```{r}
+xgb_model
+importance_matrix <- xgb.importance(model = xgb_model)
+importance_matrix <- xgb.importance(model = xgb_model)
+xgb.plot.importance(importance_matrix, xlab = "Feature Importance")
+```
+
+```{r}
+options(repr.plot.width=8, repr.plot.height=4)
+my_data = as.data.frame(cbind(predicted = predicted,
+                            observed = y_test))
+# Plot predictions vs test data
+ggplot(my_data,aes(predicted, observed)) + geom_point(color = "darkred", alpha = 0.5) + 
+    geom_smooth(method=lm)+ ggtitle('Linear Regression ') + ggtitle("Extreme Gradient Boosting: Prediction vs Test Data") +
+      xlab("Predecited Power Output ") + ylab("Observed Power Output") + 
+        theme(plot.title = element_text(color="darkgreen",size=16,hjust = 0.5),
+         axis.text.y = element_text(size=12), axis.text.x = element_text(size=12,hjust=.5),
+         axis.title.x = element_text(size=14), axis.title.y = element_text(size=14))
+```
+
+```{r}
+pred_xgb <- predict(m1_xgb, as.matrix(test[, 11:19]))
+pred<-as.data.frame(x=predicted)
+pred$ID<-c(1:20000)
+colnames(pred) <- c("Predicted","ID")
+pred<-subset(pred, select = c(ID, Predicted))
+write.csv(pred, file = "valhalla5.csv", row.names = FALSE)
+
+pred1 <- read.csv("predictions.csv")
+pred1 <- pred1[1:20000,]
+colnames(pred1) <- c("Predicted","ID")
+pred1<-subset(pred1, select = c(ID, Predicted))
+pred1 <- pred1[1:20000,]
+write.csv(pred1, file = "valhalla2.csv", row.names = FALSE)
+```
+
+function(predicted,actual){
+  #MAE
+  mae <- mean(abs(actual-predicted))
+  #MSE
+  mse <- mean((actual-predicted)^2)
+  #RMSE
+  rmse <- sqrt(mean((actual-predicted)^2))
+  #MAPE
+  mape <- mean(abs((actual-predicted)/actual))
+  errors <- c(mae,mse,rmse,mape)
+  names(errors) <- c("mae","mse","rmse","mape")
+  return(errors)
+}
