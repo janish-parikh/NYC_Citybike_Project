@@ -1,0 +1,374 @@
+---
+title: "CitiBike Data Analysis"
+date: "12/01/2021"
+author: "Janish Parikh"
+output:
+  html_document:
+    highlight: pygments
+    theme: cerulean
+    code_folding: show
+    toc: yes
+    toc_float: yes
+    toc_depth: 3
+    keep_md: yes
+    md_extensions: +grid_tables
+classoption: portrait
+urlcolor: blue
+linkcolor: blue
+editor_options:
+  chunk_output_type: inline
+header-includes: 
+- \usepackage{graphicx}
+- \usepackage{float}
+---
+
+<style>
+  .main-container {
+    max-width: 1200px !important;
+  }
+</style>
+
+---
+
+```{r setup, echo=F,message=F,warning=F}  
+knitr::opts_chunk$set(echo = TRUE, fig.pos = 'h')
+```
+
+# Loading Required Libraries
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(GGally)
+library(lubridate)
+library(caret)
+library(gbm)
+library(tidyverse)
+library(caret)
+```
+
+\newpage
+
+# 1 Abstract 
+
+The NYC "CitiBike" bicycle sharing scheme went live (in midtown and downtown Manhattan) in 2013, and has been expanding ever since, both as measured by daily ridership as well as the expanding geographic footprint incorporating a growing number of "docking stations" as the system welcomes riders in Brooklyn, Queens, and northern parts of Manhattan which were not previously served.
+
+One problem that many bikeshare systems face is money.  An increase in the number of riders who want to use the system necessitates that more bikes be purchased and put into service in order to accommodate them.  Heavy ridership induces wear on the bikes, requiring for more frequent repairs.   However, an increase in the number of trips does not necessarily translate to an increase in revenue because riders who are clever can avoid paying surcharges by keeping the length of each trip below a specified limit (either 30 or 45 minutes, depending on user category.)
+
+We seek to examine CitiBike ridership data, joined with daily NYC weather data, to study the impact of weather on shared bike usage and generate a predictive model which can estimate the number of trips that would be taken on each day.  
+The goal is to estimate future demand which would enable the system operator to make expansion plans.
+
+Our finding is that ridership exhibits strong seasonality, with correlation to weather-related variables such as daily temperature and precipitation.  Additionally, ridership is segmented by by user_type (annual subscribers use the system much more heavily than casual users), gender (there are many more male users than female) and age (a large number of users are clustered in their late 30s).
+
+# 2 Introduction 
+Since 2013 a shared bicycle system known as [CitiBike](http://www.citibikenyc.com) has been available in New York City.  The benefits to having such a system include reducing New Yorkers' dependence on automobiles and encouraging public health through the exercise attained by cycling. Additionally, users who would otherwise spend money on public transit may find bicycling more economical -- so long as they are aware of CitiBike's pricing constraints.   
+
+There are currently about 12,000 shared bikes which users can rent from about 750 [docking stations](https://member.citibikenyc.com/map/) located in Manhattan and in western portions of Brooklyn and Queens.  A rider can pick up a bike at one station and return it at a different station. The system has been expanding each year, with increases in the number of bicycles available and expansion of the geographic footprint of docking stations.  For planning purposes, the system operator needs to project future ridership in order to make good investments.
+
+The available usage data provides a wealth of information which can be mined to seek trends in usage.  With such intelligence, the company would be better positioned to determine what actions might optimize its revenue stream.
+
+# 3. Data Gathering 
+
+## Data sources and uploading
+
+I obtained data from the following source:  
+
+### 1. CitiBike trip dataset
+
+CitiBike makes a vast amount of [data](https://www.citibikenyc.com/system-data) available regarding system usage as well as sales of memberships and short-term passes.  
+
+For [each month](https://s3.amazonaws.com/tripdata/index.html) since the system's inception, there is a file containing details of (almost) every trip.  (Certain "trips" are omitted from the dataset.  For example, if a user checks out a bike from a dock but then returns it within one minute, the system drops such a "trip" from the listing, as such "trips" are not interesting.)
+
+There are currently 108 monthly data files for the New York City bikeshare system, spanning July 2013 through December 2019.  Each file contains a line for every trip.  The number of trips per month varies from as few as 200,000 during winter months in the system's early days to more than 2 million trips this past summer.
+Because of the computational limitations which this presented, I created samples of 1/1000.  The samples were created non-deterministically, by randomly selecteing 'r nrow(file)/1000' from the file.  
+
+```{r load-citibike-data, cache = TRUE}
+citibike_2019 <- read.csv("~/citibike_2019.csv")
+```
+
+### 2. Central Park daily weather data
+
+Also I obtained historical weather information for the year 2019 from the NCDC (National Climatic Data Center) by submitting an online request to https://www.ncdc.noaa.gov/cdo-web/search .  Although the weather may vary slightly within New York City, I opted to use just the data associated with the Central Park observations as proxy for the entire city's weather.
+
+We believe that the above data provides a reasonable representation of the target population (all CitiBike rides) and the citywide weather.
+
+```{r weather-data, cache = TRUE}
+weather <- read.csv("~/Downloads/Datasets/2812766.csv",header=FALSE)
+names(weather)<-weather[1,]
+weather<-weather[-1,]
+weather<-subset(weather[weather$NAME == "NY CITY CENTRAL PARK, NY US" & year(weather$DATE) == 2019,],)
+attr_indexes <- names(weather) %>% grep("ATTR",x = .)
+weather <- weather[,-attr_indexes]
+weather <- weather[,-c(1:5)]
+weather<-weather %>%mutate(across(c(where(is.character), -DATE), as.numeric))%>%mutate_all(~replace_na(., 0))
+weather$DATE<-as.Date(weather$DATE)
+weather <- weather %>% select("DATE","PRCP","SNOW","SNWD","TMAX","TMIN","WT01","WDF2","WDF5","WSF2","WSF5","WT08")
+head(weather)
+```
+```{r echo=FALSE}
+rm(attr_indexes)
+```
+
+## Description of Data    
+
+In this section, I examine selected individual variables from the CitiBike and Weather datasets.  These items require transformation and/or cleaning as there are missing values or outliers which impede analysis otherwise.
+
+```{r}
+print(paste0("The citibike data consists of ", nrow(citibike_2019), " data points spread across ", ncol(citibike_2019), " features"))
+```
+
+#### Examine variable **trip_duration**:    
+The trip_duration is specified in seconds, but there are some outliers which may be incorrect, as the value for Max is quite high:  `r summary(citibike_2019$tripduration)["Max."]` seconds, or `r summary(citibike_2019$tripduration)["Max."]/60/60/24` days.  We can assume that this data is bad, as nobody would willingly rent a bicycle for this period of time, given the fees that would be charged.  Here is a histogram of the original data distribution:
+
+#### Delete cases with unreasonable trip_duration values
+Let's assume that nobody would rent a bicycle for more than a specified timelimit (say, 3 hours), and drop any records which exceed this:
+```{r drop-long-trips}
+num_long_trips_removed<- nrow(citibike_2019[citibike_2019$tripduration > 10800,])
+citibike_2019<-citibike_2019[citibike_2019$tripduration<=10800,]
+print(paste0("Removed ", num_long_trips_removed, " trips of longer than 3 hours."))
+```
+
+#### Examine birth_year
+Other inconsistencies concern the collection of birth_year, from which we can infer the age of the participant.  There are some months in which this value is omitted, while there are other months in which all values are populated.  However, there are a few records which suggest that the rider is a centenarian -- it seems highly implausible that someone born in the 1880s is cycling around Central Park -- but the data does have such anomalies.  Thus, a substantial amount of time was needed for detecting and cleaning such inconsistencies.
+
+The birth year for some users is as old as `r summary(citibike_2019$birth.year)["Min."]`, which is not possible:
+```{r birth-year}
+summary(citibike_2019$birth.year)
+citibike_2019$age <- 2019 - citibike_2019$birth.year
+```
+
+#### Remove trips associated with very old users (age>90)
+```{r age-and-birth-year}
+num_old_age_removed<- nrow(citibike_2019[citibike_2019$age>90,])
+citibike_2019<-citibike_2019[citibike_2019$age<90,]
+print(paste0("Removed ", num_old_age_removed, " trips of people older thatn 90 years"))
+```
+
+#### Compute distance between start and end stations 
+```{r, cache=TRUE}
+library(geosphere)
+citibike_2019$distance <- distHaversine(citibike_2019[,6:7], citibike_2019[,10:11])
+citibike_2019$dist.lat <- abs((citibike_2019$start.station.latitude - citibike_2019$end.station.latitude))
+citibike_2019$dist.long <- abs((citibike_2019$start.station.longitude - citibike_2019$end.station.longitude))
+summary(citibike_2019$distance)
+```
+
+## Data Wrangling
+```{r pre-processing}
+is_weekday = function(timestamp){
+  lubridate::wday(timestamp, week_start = 1) < 6
+}
+```
+
+## Feature Extraction
+```{r, cache=TRUE}
+citibike_2019$start_date<-as.Date(citibike_2019$starttime)
+citibike_2019$Hour<-hour(citibike_2019$starttime)
+citibike_2019$dayofweek <- as.factor(wday(citibike_2019$starttime))
+citibike_2019$weekday<-as.factor(as.numeric(sapply(citibike_2019$starttime, is_weekday)))
+head(citibike_2019 %>% select("Hour","dayofweek","weekday"))
+```
+
+## Convert into factor variables
+```{r}
+citibike_2019$usertype<-as.factor(citibike_2019$usertype)
+citibike_2019$gender<-as.factor(citibike_2019$gender)
+```
+
+## Convert trip duration from seconds to minutes
+```{r}
+citibike_2019$tripduration<-floor(citibike_2019$tripduration/60)
+head(citibike_2019$tripduration)
+```
+
+## Join CItibike and Weather data
+```{r}
+citibike_2019 <- citibike_2019 %>% inner_join(weather, by = c("start_date" = "DATE" ))
+head(citibike_2019)
+```
+
+## Train - Test Split
+```{r}
+smp_size<- floor(0.8*nrow(citibike_2019))
+set.seed(123)
+train_index<-sample(seq_len(nrow(citibike_2019)), size = smp_size)
+train_data <- citibike_2019[train_index,]
+test_data <-  citibike_2019[- train_index,]
+rm(citibike_2019)
+```
+
+```{r echo=FALSE}
+rm(train_index, num_long_trips_removed, num_old_age_removed, smp_size)
+```
+## Linear Model
+
+### Determine the columns to use for prediction
+```{r}
+colstouse <-setdiff(names(train_data),c("starttime","start.station.id","end.station.id",
+                                           "stoptime","start.station.name","end.station.name",
+                                           "start.station.longitude","start_date",
+                                           "end.station.latitude","end.station.longitude",
+                                           "weekday","bikeid","birth.year","SNOW","SNWD","PRCP","DATE",
+                                        "TMIN","WT01","WDF2","WDF5","WSF2","WSF5","WT08"))
+```
+
+```{r}
+X_train<-train_data[ , which(names(train_data) %in% colstouse)]
+names(X_train)
+linear_model<-lm(tripduration~., data = X_train)
+```
+
+```{r}
+summary(linear_model)
+```
+
+# Gradient Boosted Model
+```{r}
+colstouse <-setdiff(names(train_data),c("starttime","start.station.id","end.station.id",
+                                           "stoptime","start.station.name","end.station.name",
+                                           "start.station.longitude","start_date",
+                                           "end.station.latitude","end.station.longitude",
+                                           "weekday","bikeid","birth.year","DATE"))
+X_train<-train_data[ , which(names(train_data) %in% colstouse)]
+names(X_train)
+```
+
+```{r gbm model fitting, cache = TRUE}
+library('gbm')
+
+caretGrid <- expand.grid(interaction.depth=c(5,7), 
+                         n.trees = c(150,300),
+                         shrinkage=c(0.01),
+                         n.minobsinnode=10)
+
+trainControl <- trainControl(method="cv", number=10)
+
+metric <- "RMSE"
+
+gbmmodel <- train(tripduration ~ ., 
+                 data = X_train,
+                 distribution = "gaussian",
+                 method = "gbm", 
+                 trControl = trainControl,
+                 tuneGrid=caretGrid,
+                 metric=metric, 
+                 bag.fraction=0.75,
+                 verbose = F)
+```
+
+```{r}
+print(gbmmodel)
+summary(gbmmodel)
+```
+
+## Evaluate Performance on the train data
+```{r}
+y_test<-train_data$tripduration
+predicted = predict(gbmmodel,train_data)
+residuals = y_test - predicted
+RMSE = sqrt(mean(residuals^2))
+cat('The root mean square error of the train data is ', round(RMSE,3),'\n')
+```
+
+```{r}
+y_test_mean = mean(y_test)
+# Calculate total sum of squares
+tss =  sum((y_test - y_test_mean)^2 )
+# Calculate residual sum of squares
+rss =  sum(residuals^2)
+# Calculate R-squared
+rsq  =  1 - (rss/tss)
+cat('The R-square of the train data is ', round(rsq,3), '\n')
+```
+
+```{r}
+options(repr.plot.width=8, repr.plot.height=4)
+my_data = as.data.frame(cbind(predicted = predicted,
+                            observed = y_test))
+# Plot predictions vs test data
+ggplot(my_data,aes(predicted, observed)) + geom_point(color = "darkred", alpha = 0.5) + 
+    geom_smooth(method=lm)+ ggtitle('Linear Regression ') + ggtitle("Gradient Boosting Machine: Prediction vs Test Data") +
+      xlab("Predecited Trip Duration in Seconds ") + ylab("Observed Trip Duration in Secons") + 
+        theme(plot.title = element_text(size=16,hjust = 0.5),
+         axis.text.y = element_text(size=12), axis.text.x = element_text(size=12,hjust=.5),
+         axis.title.x = element_text(size=14), axis.title.y = element_text(size=14))
+```
+
+## Evaluate Performance on the validation data
+```{r}
+validation_data <- read.csv("~/Downloads/Datasets/citybike.test10000Awithduration.csv")
+```
+
+### Perform same preprocessing on validation data set
+```{r cache=TRUE}
+validation_data<-validation_data[validation_data$tripduration<=10800,]
+validation_data$age <- 2019 - validation_data$birth.year
+validation_data<-validation_data[validation_data$age<90,]
+validation_data$distance <- distHaversine(validation_data[,5:6], validation_data[,9:10])
+validation_data$dist.lat <- abs((validation_data$start.station.latitude - validation_data$end.station.latitude))
+validation_data$dist.long <- abs((validation_data$start.station.longitude - validation_data$end.station.longitude))
+validation_data$Hour<-hour(validation_data$starttime)
+validation_data$dayofweek <- as.factor(wday(validation_data$starttime))
+validation_data$weekday<-as.factor(as.numeric(sapply(validation_data$starttime, is_weekday)))
+head(validation_data %>% select("Hour","dayofweek","weekday"))
+validation_data$usertype<-as.factor(validation_data$usertype)
+validation_data$gender<-as.factor(validation_data$gender)
+```
+
+```{r}
+y_test<-validation_data$tripduration
+predicted = predict(gbmmodel,validation_data)
+residuals = y_test - predicted
+RMSE = sqrt(mean(residuals^2))
+cat('The root mean square error of the validation data is ', round(RMSE,3),'\n')
+```
+
+```{r}
+y_test_mean = mean(y_test)
+# Calculate total sum of squares
+tss =  sum((y_test - y_test_mean)^2 )
+# Calculate residual sum of squares
+rss =  sum(residuals^2)
+# Calculate R-squared
+rsq  =  1 - (rss/tss)
+cat('The R-square of the validation data is ', round(rsq,3), '\n')
+```
+
+```{r}
+options(repr.plot.width=8, repr.plot.height=4)
+my_data = as.data.frame(cbind(predicted = predicted,
+                            observed = y_test))
+# Plot predictions vs test data
+ggplot(my_data,aes(predicted, observed)) + geom_point(color = "darkred", alpha = 0.5) + 
+    geom_smooth(method=lm)+ ggtitle('Linear Regression ') + ggtitle("Gradient Boosting Machines: Prediction vs Test Data") +
+      xlab("Predecited Trip Duration in Secons ") + ylab("Observed Trip Duration in Secons") + 
+        theme(plot.title = element_text(size=16,hjust = 0.5),
+         axis.text.y = element_text(size=12), axis.text.x = element_text(size=12,hjust=.5),
+         axis.title.x = element_text(size=14), axis.title.y = element_text(size=14))
+```
+
+## Run Inference on the test data
+```{r}
+test_data<-read.csv("~/Downloads/Datasets/citybike.test20000.csv")
+```
+
+### Perform data preprocessing
+```{r}
+test_data$age <- 2019 - test_data$birth.year
+test_data$distance <- distHaversine(test_data[,4:5], test_data[,8:9])
+test_data$dist.lat <- abs((test_data$start.station.latitude - test_data$end.station.latitude))
+test_data$dist.long <- abs((test_data$start.station.longitude - test_data$end.station.longitude))
+test_data$Hour<-hour(test_data$starttime)
+test_data$dayofweek <- as.factor(wday(test_data$starttime))
+test_data$weekday<-as.factor(as.numeric(sapply(test_data$starttime, is_weekday)))
+test_data$usertype<-as.factor(test_data$usertype)
+test_data$gender<-as.factor(test_data$gender)
+```
+
+```{r}
+predicted = predict(gbmmodel,test_data)
+pred<-as.data.frame(x=predicted)
+pred$ID<-c(1:20000)
+colnames(pred) <- c("Predicted","ID")
+pred<-subset(pred, select = c(ID, Predicted))
+write.csv(pred, file = "valhalla5.csv", row.names = FALSE)
+```
